@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Đo khoảng cách xe phía trước v2</title>
+<style>
+html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif;overflow:hidden}
+#wrap{position:relative;width:100%;height:100%}
+video,canvas#c{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#hud{position:absolute;left:0;right:0;top:0;padding:8px 14px;display:flex;justify-content:space-between;align-items:flex-start;pointer-events:none;text-shadow:0 2px 6px #000}
+#dist{font-size:60px;font-weight:700;line-height:1}
+#status{font-size:14px;margin-top:4px}
+#side{text-align:right;font-size:18px;line-height:1.4}
+#side small{font-size:12px;opacity:.8}
+#bar{position:absolute;left:0;right:0;bottom:0;padding:8px;display:flex;gap:6px;flex-wrap:wrap;background:rgba(0,0,0,.55)}
+button,select{font-size:15px;padding:9px 12px;border-radius:10px;border:0;background:#2563eb;color:#fff}
+button.gray{background:#444}button.red{background:#dc2626}
+#panel{position:absolute;right:8px;bottom:64px;width:min(320px,90%);background:rgba(20,20,20,.92);border-radius:12px;padding:12px;display:none;font-size:14px}
+#panel label{display:block;margin:8px 0 2px}
+#panel input[type=range]{width:100%}
+#panel .row{display:flex;align-items:center;justify-content:space-between;margin:6px 0}
+#start{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;background:#111;text-align:center;padding:20px;z-index:5;overflow:auto}
+#start p{max-width:460px;font-size:15px;line-height:1.5;opacity:.85;margin:0}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div><div id="dist">-- m</div><div id="status">Đang khởi động...</div></div>
+    <div id="side"><div id="ttc">TTC: --</div><div id="spd">Tốc độ: -- km/h</div><div id="hw">Cách: -- s</div><small id="fps"></small></div>
+  </div>
+  <div id="panel">
+    <b>Cài đặt</b>
+    <label>Đường chân trời: <span id="hv">45</span>% chiều cao (kéo cho vạch ngang khớp chân trời thật)</label>
+    <input type="range" id="hor" min="25" max="65" value="45">
+    <label>Lệch tâm ngang: <span id="cv">0</span>%</label>
+    <input type="range" id="cxo" min="-20" max="20" value="0">
+    <div class="row"><span>Cảnh báo khi cách &lt;</span>
+      <select id="warn"><option value="5">5 m</option><option value="8">8 m</option><option value="12" selected>12 m</option><option value="20">20 m</option><option value="30">30 m</option></select></div>
+    <div class="row"><span>Tự nhận diện làn</span><input type="checkbox" id="autolane" checked></div>
+    <div class="row"><span>Chỉ đo xe cùng làn</span><input type="checkbox" id="onlylane" checked></div>
+    <div class="row"><span>Âm báo</span><input type="checkbox" id="snd" checked></div>
+  </div>
+  <div id="bar">
+    <button id="cal">Hiệu chuẩn</button>
+    <button class="gray" id="set">⚙ Cài đặt</button>
+    <button id="rec">● Ghi hành trình</button>
+    <button class="gray" id="exp">Xuất CSV</button>
+  </div>
+  <div id="start">
+    <h2 style="margin:0">Đo khoảng cách xe phía trước v2</h2>
+    <p>Đặt điện thoại nằm ngang trên taplo, camera sau hướng thẳng về phía trước. Vào ⚙ Cài đặt, kéo vạch chân trời khớp với đường chân trời thật.</p>
+    <p>Tính năng mới: nhận diện làn đường (chỉ đo xe cùng làn), thời gian va chạm dự kiến (TTC), tốc độ GPS và khoảng cách theo thời gian, ghi hành trình xuất CSV.</p>
+    <p><b>Lưu ý:</b> số liệu chỉ để tham khảo (sai số khoảng 10–20%), không thay thế quan sát và phanh của người lái. Cần Internet khi tải mô hình lần đầu.</p>
+    <button id="go">Bắt đầu</button>
+  </div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const REAL_W={car:1.8,truck:2.5,bus:2.5,motorcycle:0.8};
+const LABEL={car:"Ô tô",truck:"Xe tải",bus:"Xe buýt",motorcycle:"Xe máy"};
+const v=$('v'),c=$('c'),ctx=c.getContext('2d');
+let model,smooth=null,hist=[],closing=0,lastT=performance.now(),frame=0;
+let lastBox=null,audio=null,lastBeep=0,gpsSpeed=null,wakeLock=null;
+let lane={l:null,r:null,auto:false};
+try{const s=localStorage.getItem('focalRatio');if(s)window._fr=parseFloat(s)}catch(e){}
+
+// ---------- Cài đặt ----------
+$('set').onclick=()=>{const p=$('panel');p.style.display=p.style.display==='block'?'none':'block'};
+$('hor').oninput=e=>$('hv').textContent=e.target.value;
+$('cxo').oninput=e=>$('cv').textContent=e.target.value;
+const horizon=()=>parseFloat($('hor').value)/100;
+const cxOff=()=>parseFloat($('cxo').value)/100;
+
+// ---------- Âm báo ----------
+function beep(level){
+  if(!$('snd').checked)return;const n=Date.now();
+  if(n-lastBeep<(level>=2?300:800))return;lastBeep=n;
+  try{audio=audio||new (window.AudioContext||window.webkitAudioContext)();
+  const o=audio.createOscillator(),g=audio.createGain();o.frequency.value=level>=2?1200:800;
+  o.connect(g);g.connect(audio.destination);g.gain.value=.3;o.start();o.stop(audio.currentTime+.18);}catch(e){}
+}
+
+// ---------- Khởi động ----------
+$('go').onclick=async()=>{
+  $('start').style.display='none';
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}},audio:false});
+    v.srcObject=stream;await v.play();
+    try{wakeLock=await navigator.wakeLock.request('screen')}catch(e){}
+  }catch(err){$('status').textContent='Không mở được camera: '+err.message;return}
+  try{navigator.geolocation.watchPosition(p=>{gpsSpeed=p.coords.speed;window._pos=p.coords},()=>{},{enableHighAccuracy:true,maximumAge:1000})}catch(e){}
+  $('status').textContent='Đang tải mô hình nhận diện...';
+  model=await cocoSsd.load({base:'lite_mobilenet_v2'});
+  $('status').textContent='Sẵn sàng';
+  loop();
+};
+
+function focalPx(){const w=v.videoWidth;return window._fr?window._fr*w:(w/2)/Math.tan(70*Math.PI/360)}
+
+// ---------- Nhận diện làn đường (nhẹ, không cần OpenCV) ----------
+// Các vạch làn đều hội tụ về điểm tụ (cx, chân trời). Mỗi điểm biên "bỏ phiếu" cho vị trí xb
+// mà đường thẳng nối điểm tụ với nó cắt đáy ảnh. Đỉnh phiếu bên trái/phải = 2 vạch làn.
+const SW=192,SH=108,sc=document.createElement('canvas');sc.width=SW;sc.height=SH;
+const sx=sc.getContext('2d',{willReadFrequently:true});
+function detectLanes(){
+  sx.drawImage(v,0,0,SW,SH);
+  const d=sx.getImageData(0,0,SW,SH).data,g=new Float32Array(SW*SH);
+  for(let i=0;i<SW*SH;i++)g[i]=0.3*d[i*4]+0.59*d[i*4+1]+0.11*d[i*4+2];
+  const hy=horizon()*SH,cx=SW/2+cxOff()*SW,span=SW*1.5,BIN=SW/60,NB=Math.ceil(2*span/BIN);
+  const H=new Float32Array(NB);
+  for(let y=Math.ceil(hy+10);y<SH-2;y++){
+    const k=(SH-hy)/(y-hy);
+    for(let x=2;x<SW-2;x++){
+      const gx=Math.abs(g[y*SW+x+1]-g[y*SW+x-1]),gy=Math.abs(g[(y+1)*SW+x]-g[(y-1)*SW+x]);
+      const m=gx-0.7*gy; if(m<28)continue;
+      const xb=cx+(x-cx)*k,b=Math.floor((xb-(cx-span))/BIN);
+      if(b>=0&&b<NB)H[b]+=m*(y-hy)/SH;
+    }
+  }
+  const S=new Float32Array(NB);for(let i=1;i<NB-1;i++)S[i]=H[i-1]*.5+H[i]+H[i+1]*.5;
+  const bx=b=>cx-span+(b+.5)*BIN,mid=Math.floor((cx-(cx-span))/BIN);
+  const peak=(a,b)=>{let bi=-1,bv=0,sum=0,n=0;for(let i=a;i<b;i++){sum+=S[i];n++;if(S[i]>bv){bv=S[i];bi=i}}
+    return(bi>=0&&bv>3*(sum/n)&&bv>150)?bx(bi):null};
+  const L=peak(Math.max(1,mid-Math.floor(SW*1.2/BIN)),mid-1),R=peak(mid+1,Math.min(NB-1,mid+Math.floor(SW*1.2/BIN)));
+  if(L!=null&&R!=null&&R-L>0.3*SW&&R-L<1.6*SW){
+    const k=v.videoWidth/SW;
+    lane.l=lane.l==null?L*k:lane.l*.85+L*k*.15;
+    lane.r=lane.r==null?R*k:lane.r*.85+R*k*.15;
+    lane.auto=true;lane.miss=0;
+  }else{lane.miss=(lane.miss||0)+1;if(lane.miss>15)lane.auto=false}
+}
+function laneEdges(){
+  const W=v.videoWidth,cx=W/2+cxOff()*W;
+  if($('autolane').checked&&lane.auto&&lane.l!=null)return{l:lane.l,r:lane.r,cx,auto:true};
+  return{l:cx-0.30*W,r:cx+0.30*W,cx,auto:false}; // làn mặc định ±30% bề rộng tại đáy ảnh
+}
+
+// ---------- Chọn xe cùng làn ----------
+function pickFront(preds,E){
+  const W=v.videoWidth,H=v.videoHeight,hy=horizon()*H;
+  let best=null,bs=-1;const others=[];
+  for(const p of preds){
+    if(!REAL_W[p.class]||p.score<0.5)continue;
+    const [x,y,w,h]=p.bbox,bottom=y+h;
+    let inLane=true;
+    if(bottom>hy+5){
+      const xb=E.cx+(x+w/2-E.cx)*(H-hy)/(bottom-hy);
+      const m=0.12*(E.r-E.l);inLane=xb>E.l-m&&xb<E.r+m;
+    }else inLane=false;
+    if(!$('onlylane').checked)inLane=Math.abs((x+w/2)-W/2)<0.35*W;
+    if(inLane){if(bottom>bs){bs=bottom;best=p}}else others.push(p);
+  }
+  return{best,others};
+}
+
+// ---------- Ghi hành trình ----------
+let rec=null;
+$('rec').onclick=()=>{
+  if(!rec){rec={t0:Date.now(),rows:[],last:0,n1:0,n2:0,minD:Infinity,maxC:0,minTTC:Infinity,lvl:0,lvlT:0};
+    $('rec').textContent='■ Dừng ghi';$('rec').className='red'}
+  else{
+    const dur=(Date.now()-rec.t0)/1000;
+    alert('Kết thúc hành trình\nThời gian: '+Math.floor(dur/60)+' phút '+Math.round(dur%60)+' giây\n'+
+      'Khoảng cách gần nhất: '+(isFinite(rec.minD)?rec.minD.toFixed(1)+' m':'--')+'\n'+
+      'Tốc độ áp sát lớn nhất: '+(rec.maxC*3.6).toFixed(0)+' km/h\n'+
+      'TTC nhỏ nhất: '+(isFinite(rec.minTTC)?rec.minTTC.toFixed(1)+' s':'--')+'\n'+
+      'Số lần cảnh báo vàng/đỏ: '+rec.n1+' / '+rec.n2+'\n\nBấm "Xuất CSV" để lưu số liệu chi tiết.');
+    rec.done=true;window._lastTrip=rec;rec=null;$('rec').textContent='● Ghi hành trình';$('rec').className=''}
+};
+$('exp').onclick=async()=>{
+  const r=rec||window._lastTrip;
+  if(!r||!r.rows.length){alert('Chưa có dữ liệu. Hãy bấm "Ghi hành trình" khi đang lái.');return}
+  const csv='\ufeffThoi_gian,Khoang_cach_m,Toc_do_ap_sat_m_s,TTC_s,Toc_do_xe_km_h,Khoang_cach_theo_thoi_gian_s,Muc_canh_bao,Vi_do,Kinh_do\n'+
+    r.rows.map(a=>a.join(',')).join('\n');
+  const name='hanh-trinh-'+new Date(r.t0).toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';
+  const P=window.Capacitor&&Capacitor.Plugins;
+  if(P&&P.Filesystem&&P.Share&&Capacitor.isNativePlatform&&Capacitor.isNativePlatform()){
+    try{const w=await P.Filesystem.writeFile({path:name,data:csv,directory:'CACHE',encoding:'utf8'});
+      await P.Share.share({title:name,url:w.uri,dialogTitle:'Lưu / gửi file hành trình'});}
+    catch(e){alert('Không xuất được: '+(e.message||e))}
+    return}
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=name;a.click();
+};
+function logRow(d,vc,ttc,kmh,hw,lvl){
+  if(!rec)return;const n=Date.now();
+  if(d!=null){rec.minD=Math.min(rec.minD,d);rec.maxC=Math.max(rec.maxC,vc||0);if(ttc!=null)rec.minTTC=Math.min(rec.minTTC,ttc)}
+  if(lvl>rec.lvl&&n-rec.lvlT>3000){if(lvl>=2)rec.n2++;else rec.n1++;rec.lvlT=n}
+  rec.lvl=lvl;
+  if(n-rec.last<1000)return;rec.last=n;
+  const p=window._pos||{};
+  rec.rows.push([new Date(n).toLocaleTimeString('vi-VN'),d!=null?d.toFixed(1):'',d!=null?vc.toFixed(2):'',ttc!=null?ttc.toFixed(1):'',
+    kmh!=null?kmh.toFixed(0):'',hw!=null?hw.toFixed(1):'',lvl,p.latitude?p.latitude.toFixed(6):'',p.longitude?p.longitude.toFixed(6):'']);
+}
+
+// ---------- Vòng lặp chính ----------
+async function loop(){
+  const W=v.videoWidth,H=v.videoHeight;
+  if((frame++%3)===0&&$('autolane').checked)detectLanes();
+  const E=laneEdges();
+  const preds=await model.detect(v,10,0.4);
+  c.width=W;c.height=H;ctx.clearRect(0,0,W,H);
+  const hy=horizon()*H;
+  // vẽ làn
+  ctx.fillStyle=E.auto?'rgba(34,197,94,.18)':'rgba(250,204,21,.15)';
+  ctx.beginPath();ctx.moveTo(E.cx,hy);ctx.lineTo(E.l,H);ctx.lineTo(E.r,H);ctx.closePath();ctx.fill();
+  ctx.strokeStyle=E.auto?'#22c55e':'#facc15';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(E.cx,hy);ctx.lineTo(E.l,H);ctx.moveTo(E.cx,hy);ctx.lineTo(E.r,H);ctx.stroke();
+  ctx.setLineDash([12,10]);ctx.strokeStyle='rgba(255,255,255,.5)';ctx.beginPath();ctx.moveTo(0,hy);ctx.lineTo(W,hy);ctx.stroke();ctx.setLineDash([]);
+
+  const {best,others}=pickFront(preds,E);
+  for(const p of others){ctx.lineWidth=2;ctx.strokeStyle='rgba(200,200,200,.6)';ctx.strokeRect(...p.bbox)}
+  const now=performance.now(),dt=(now-lastT)/1000;lastT=now;
+  $('fps').textContent=(1/dt).toFixed(0)+' fps · làn: '+(E.auto?'tự động':'mặc định');
+  const kmh=(gpsSpeed!=null&&gpsSpeed>=0)?gpsSpeed*3.6:null;
+  $('spd').textContent='Tốc độ: '+(kmh!=null?kmh.toFixed(0):'--')+' km/h';
+
+  let d=null,ttc=null,hw=null,lvl=0;
+  if(best){
+    const [x,y,w,h]=best.bbox;lastBox={w,cls:best.class};
+    const raw=REAL_W[best.class]*focalPx()/w;
+    smooth=smooth==null?raw:smooth*.7+raw*.3;d=smooth;
+    hist.push({t:now,d});while(hist.length&&now-hist[0].t>1200)hist.shift();
+    if(hist.length>=5){ // hồi quy tuyến tính khoảng cách theo thời gian
+      const n=hist.length,t0=hist[0].t;let st=0,sd=0,stt=0,std=0;
+      for(const q of hist){const t=(q.t-t0)/1000;st+=t;sd+=q.d;stt+=t*t;std+=t*q.d}
+      const den=n*stt-st*st;if(den>1e-6){const slope=(n*std-st*sd)/den;closing=closing*.6+(-slope)*.4}
+    }
+    if(closing>0.8)ttc=d/closing;
+    if(kmh!=null&&kmh>10)hw=d/(kmh/3.6);
+    const warnAt=parseFloat($('warn').value);
+    if(d<warnAt||(ttc!=null&&ttc<4)||(hw!=null&&hw<1.0))lvl=1;
+    if(d<warnAt*0.6||(ttc!=null&&ttc<2.5))lvl=2;
+    const col=lvl>=2?'#ef4444':lvl===1?'#f59e0b':'#22c55e';
+    ctx.lineWidth=5;ctx.strokeStyle=col;ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle=col;ctx.font='bold 34px sans-serif';
+    ctx.fillText((LABEL[best.class]||best.class)+' '+d.toFixed(1)+' m',x,Math.max(40,y-10));
+    $('dist').textContent=d.toFixed(1)+' m';$('dist').style.color=col;
+    $('status').textContent=(LABEL[best.class]||best.class)+(lvl>=2?' – NGUY CƠ VA CHẠM!':lvl===1?' – CHÚ Ý KHOẢNG CÁCH':'')+
+      (closing>0.8?' · đang áp sát '+(closing*3.6).toFixed(0)+' km/h':closing<-0.8?' · đang giãn ra':'');
+    $('ttc').textContent='TTC: '+(ttc!=null?ttc.toFixed(1)+' s':'--');
+    $('hw').textContent='Cách: '+(hw!=null?hw.toFixed(1)+' s':'-- s');
+    if(lvl>0)beep(lvl);
+  }else{
+    smooth=null;hist=[];closing=0;
+    $('dist').textContent='-- m';$('dist').style.color='#fff';$('ttc').textContent='TTC: --';$('hw').textContent='Cách: -- s';
+    $('status').textContent='Không thấy xe cùng làn phía trước';
+  }
+  logRow(d,closing,ttc,kmh,hw,lvl);
+  requestAnimationFrame(loop);
+}
+
+// ---------- Hiệu chuẩn ----------
+$('cal').onclick=()=>{
+  if(!lastBox){alert('Chưa thấy xe phía trước. Hãy đưa xe vào khung hình rồi bấm lại.');return}
+  const s=prompt('Nhập khoảng cách THỰC TẾ (mét) tới xe đang được nhận diện:\n(Mẹo: đỗ xe sau một xe con, đo bằng thước dây ~ 5–10 m)','8');
+  const d=parseFloat((s||'').replace(',','.'));if(!d||d<=0)return;
+  window._fr=(d*lastBox.w/REAL_W[lastBox.cls])/v.videoWidth;
+  try{localStorage.setItem('focalRatio',window._fr)}catch(e){}
+  smooth=null;hist=[];alert('Đã hiệu chuẩn xong.');
+};
+</script>
+</body>
+</html>
